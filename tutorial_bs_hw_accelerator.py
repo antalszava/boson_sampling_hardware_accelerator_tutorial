@@ -1,4 +1,5 @@
 import numpy as np
+
 import piquasso as pq
 from numpy.linalg import svd
 
@@ -7,91 +8,84 @@ from scipy.special import factorial, genlaguerre
 from scipy.constants import pi
 from scipy.linalg import sqrtm
 
-
-def lowdin(P, tol=1e-12):
-    # Overlap / Gram matrix (Hermitian)
-    M = P.conj().T @ P
-
-    # Eigen-decomposition of Hermitian M
-    w, U = np.linalg.eigh(M)
-
-    # Handle near-linear dependence (optional)
-    keep = w > tol
-    U = U[:, keep]
-    w = w[keep]
-
-    Minv_sqrt = U @ np.diag(1.0 / np.sqrt(w)) @ U.conj().T
-    B = P @ Minv_sqrt
-
+def lowdin(P):
     n, k = P.shape
-    mx1 = B.T.conj() @ B
-    mx2 = B @ B.T.conj()
-    assert np.allclose(mx1, np.identity(k))
-    assert np.allclose(mx2, np.identity(n))
-    return B
+
+    U, _, Vh = np.linalg.svd(P, full_matrices=False)
+
+    b = U @ Vh
+
+    mx1 = b.T.conj() @ b
+    mx2 = b @ b.T.conj()
+    if n < k:
+        assert np.allclose(mx2, np.identity(n))
+    elif k < n:
+        assert np.allclose(mx1, np.identity(n))
+    else:
+        assert np.allclose(mx1, np.identity(n))
+        assert np.allclose(mx2, np.identity(n))
+
+    return b
 
 def eigenfunction_2d_equation17(x, y, n, m):
     """
     Equation (17): Phase-convention eigenfunction ψ_{nm}(x, y) used throughout the paper.
     ψ_{nm} = √[1/((1/2(n-m))! (1/2(n+m))!)] * r^m / √π * L^m_{(n-m)/2}(r²) * e^{-r²/2} * e^{i m φ}
-    
+
     Converts Cartesian (x,y) to polar (r, φ) internally.
     Uses the specific phase convention from eqs (13)-(17) [web:1].
-    
+
     Parameters:
     x, y: Cartesian coordinates
     n: principal quantum number (n >= |m|, n - m even)
     m: angular momentum quantum number (m >= 0 for this form)
-    
+
     Returns:
     ψ_{nm}(x, y)
     """
     r = np.sqrt(x**2 + y**2)
     phi = np.arctan2(y, x)
-    abs_m = np.abs(m)
-    
-    # Equation (13) from "Energy level splitting for weakly interacting bosons
-    # in a harmonic trap" - https://www.arxiv.org/pdf/1903.04974
+
+    # Validation: n >= m >= 0, n - m even (as per eq 17 form)
+    if m < 0 or n < m or (n - m) % 2 != 0:
+        return 0.0
+
     # Factorials in denominator: (1/2(n-m))! and (1/2(n+m))!
-    fact1 = factorial((n - abs_m)/2)
-    fact2 = factorial((n + abs_m)/2)
-    
-    # Normalization factor
+    fact1 = factorial((n - m)/2)
+    fact2 = factorial((n + m)/2)
+
+    # Normalization factor from eq (17)
     norm_factor = np.sqrt(fact1 / fact2)
-    
-    # Laguerre polynomial L^|m|_{(n-|m|)/2}(r²)
+
+    # Laguerre polynomial L^m_{(n-m)/2}(r²) - no absolute value on m
     laguerre_arg = r**2
-    L = genlaguerre((n - abs_m)/2, abs_m)(laguerre_arg)
-    
-    phase_factor = (-1) ** (1/2*(m-abs_m))
+    L = genlaguerre(m, (n - m)/2)(laguerre_arg)
 
-    psi_norm = norm_factor * (r**abs_m / np.sqrt(pi)) * L * np.exp(-r**2 / 2) * np.exp(1j * m * phi)
+    # Full wavefunction per eq (17)
+    psi = norm_factor * (r**m / np.sqrt(pi)) * L * np.exp(-r**2 / 2) * np.exp(1j * m * phi)
 
-    # Full wavefunction per eq (13)
-    psi = phase_factor * psi_norm
-    
     return psi
 
 # Assume eigenfunction_2d_equation17(x, y, n, m) is already defined elsewhere.
 
 # ----- 1. Discretize space and build orbitals -----
-
-def build_single_particle_orbitals(n_orbitals, positions):
+def build_single_particle_orbitals(positions, quantum_numbers=None):
     """
     positions: array of shape (n_modes, 2) with (x,y) for each spatial mode χ_j
     returns: orbital_matrix[i, j] = ψ_i(χ_j)
     """
+    n_orbitals = 3
     n_modes = positions.shape[0]
     orbital_matrix = np.zeros((n_orbitals, n_modes), dtype=complex)
 
     # Example: label orbitals by (n, m) along some sequence
     # You can change this to match the spectrum you want.
-    quantum_numbers = [(0, 0), (1, 1), (1, -1), (2, 0), (2, 2), (2, -2)][:n_orbitals]
+    if quantum_numbers is None:
+        quantum_numbers = [(0, 0), (1, 1), (2, 2)]
 
     for i, (n, m) in enumerate(quantum_numbers):
         for j, (x, y) in enumerate(positions):
             orbital_matrix[i, j] = eigenfunction_2d_equation17(x, y, n, m)
-
     return orbital_matrix
 
 # ----- 3. Piquasso boson-sampling circuit -----
@@ -147,18 +141,73 @@ def efimov_potential_3body(positions_xyz, C=1.0):
         return 0.0  # hard-shell cutoff in discrete model
     return -(C + 0.25) / R2
 
-def pad_to_square(A):
-    n, m = A.shape
-    N = max(n, m)
-    B = np.zeros((N, N), dtype=A.dtype)
-    B[:n, :m] = A
-    return B
+def extend_to_orthonormal_rows(mat_with_ortogonal_rows, seed=None, tol=1e-12, max_tries=10_000):
+    """
+
+    Args:
+
+       mat_with_ortogonal_rows: (3, 12) numpy array (real or complex). Rows assumed mutually orthogonal
+           under the Hermitian inner product <u,v> = vdot(u,v).
+
+    Returns:
+
+      Q: (12, 12) with orthonormal rows under Hermitian inner product,
+         i.e., Q @ Q.conj().T == I.
+    """
+    A = np.asarray(mat_with_ortogonal_rows)
+    if A.shape != (3, 12):
+        raise ValueError(f"Expected shape (3,12), got {A.shape}")
+
+    # Preserve complex dtype if present; otherwise promote to complex128 safely
+    if not np.iscomplexobj(A):
+        A = A.astype(np.complex128)
+
+    rng = np.random.default_rng(seed)
+
+    basis = [A[i].copy() for i in range(3)]
+
+    def hermitian_proj_coeff(b, w):
+        # coefficient c such that w - c*b removes component along b:
+        # c = <b,w>/<b,b> with Hermitian inner product implemented by vdot (conjugates first arg) [web:28]
+        bb = np.vdot(b, b)
+        if np.abs(bb) <= tol:
+            return 0.0 + 0.0j
+        return np.vdot(b, w) / bb
+
+    def orthogonalize(v, basis_list):
+        w = v.copy()
+        for b in basis_list:
+            w = w - hermitian_proj_coeff(b, w) * b
+        return w
+
+    tries = 0
+    while len(basis) < 12:
+        if tries >= max_tries:
+            raise RuntimeError("Could not generate enough independent vectors; increase max_tries or check input.")
+        tries += 1
+
+        # random complex vector (real + i*imag)
+        v = rng.standard_normal(12) + 1j * rng.standard_normal(12)
+        w = orthogonalize(v, basis)
+
+        if np.linalg.norm(w) > tol:
+            basis.append(w)
+
+    Q = np.stack(basis, axis=0)  # (12, 12)
+
+    # Normalize rows at the end using the Hermitian norm ||q|| = sqrt(<q,q>) [web:28]
+    row_norms = np.sqrt(np.real(np.vdot(Q, Q).reshape(1, 1)))  # not used; kept simple below
+
+    # Better: per-row norms
+    norms = np.sqrt(np.real(np.einsum('ij,ij->i', Q.conj(), Q)))
+    Q = Q / norms[:, None]
+
+    return Q
 
 # ----- 6. Boson-sampling-assisted Monte Carlo integration -----
 
 def boson_sampling_monte_carlo(
     positions,
-    n_orbitals=3,
     input_occupation=None,
     n_samples=10_000,
     potential_fn=efimov_potential_3body,
@@ -172,15 +221,18 @@ def boson_sampling_monte_carlo(
     """
     m = positions.shape[0]
     if input_occupation is None:
-        # Example: 3 bosons in first 3 modes
+        # 1 photon in the first 3 modes
         input_occupation = [1, 1, 1] + [0] * (m - 3)
 
     # 1) Orbitals and unitary
-    orbital_matrix = build_single_particle_orbitals(n_orbitals, positions)
-    orbital_matrix = pad_to_square(orbital_matrix)
+    orbital_matrix = build_single_particle_orbitals(positions)
 
-    #unitary = lowdin(orbital_matrix)
-    unitary, _ = np.linalg.qr(orbital_matrix, mode="complete")
+    assert np.linalg.matrix_rank(orbital_matrix) == orbital_matrix.shape[0]
+
+    ortogonal_rows_mat = lowdin(orbital_matrix)
+    assert np.linalg.matrix_rank(ortogonal_rows_mat) == orbital_matrix.shape[0]
+
+    unitary = extend_to_orthonormal_rows(ortogonal_rows_mat, seed=0)
 
     # 2) Build Piquasso program and simulator
     prog = build_piquasso_program(unitary, input_occupation)
@@ -212,7 +264,6 @@ if __name__ == "__main__":
 
     estimate, error = boson_sampling_monte_carlo(
         positions,
-        n_orbitals=5,
-        n_samples=1000,
+        n_samples=10000,
     )
     print(f"Estimated E^(1) ≈ {estimate:.4f} ± {error:.4f}")
