@@ -66,7 +66,6 @@ def eigenfunction_2d_equation17(x, y, n, m):
 
     return psi
 
-# Assume eigenfunction_2d_equation17(x, y, n, m) is already defined elsewhere.
 
 # ----- 1. Discretize space and build orbitals -----
 def build_single_particle_orbitals(positions, quantum_numbers=None):
@@ -74,14 +73,14 @@ def build_single_particle_orbitals(positions, quantum_numbers=None):
     positions: array of shape (n_modes, 2) with (x,y) for each spatial mode χ_j
     returns: orbital_matrix[i, j] = ψ_i(χ_j)
     """
-    n_orbitals = 3
-    n_modes = positions.shape[0]
-    orbital_matrix = np.zeros((n_orbitals, n_modes), dtype=complex)
-
     # Example: label orbitals by (n, m) along some sequence
     # You can change this to match the spectrum you want.
     if quantum_numbers is None:
         quantum_numbers = [(0, 0), (1, 1), (2, 2)]
+
+    n_orbitals = len(quantum_numbers)
+    n_modes = positions.shape[0]
+    orbital_matrix = np.zeros((n_orbitals, n_modes), dtype=complex)
 
     for i, (n, m) in enumerate(quantum_numbers):
         for j, (x, y) in enumerate(positions):
@@ -99,6 +98,7 @@ def build_piquasso_program(unitary, input_occupation):
     instructions = []
 
     instructions.append(pq.Vacuum().on_modes(*range(m)))
+
     # Prepare Fock input state
     for mode, n in enumerate(input_occupation):
         if n > 0:
@@ -121,7 +121,7 @@ def pattern_to_positions(pattern, positions):
     returns: array of shape (n_bosons, 2) with positions of each boson
     collision-free assumed here (0 or 1 per mode).
     """
-    idx = [i for i, n in enumerate(pattern) if n > 0]
+    idx = [i for i, n in enumerate(pattern) if n == 1]
     return positions[idx, :]
 
 # ----- 5. Define perturbation V(X) (Efimov-like example) -----
@@ -139,7 +139,7 @@ def efimov_potential_3body(positions_xyz, C=1.0):
     R2 = (2.0 / 3.0) * (r12**2 + r13**2 + r23**2)
     if R2 == 0:
         return 0.0  # hard-shell cutoff in discrete model
-    return -(C + 0.25) / R2
+    return -(C + 1/4) / R2
 
 def extend_to_orthonormal_rows(mat_with_ortogonal_rows, seed=None, tol=1e-12, max_tries=10_000):
     """
@@ -154,21 +154,13 @@ def extend_to_orthonormal_rows(mat_with_ortogonal_rows, seed=None, tol=1e-12, ma
       Q: (12, 12) with orthonormal rows under Hermitian inner product,
          i.e., Q @ Q.conj().T == I.
     """
-    A = np.asarray(mat_with_ortogonal_rows)
-    if A.shape != (3, 12):
-        raise ValueError(f"Expected shape (3,12), got {A.shape}")
-
-    # Preserve complex dtype if present; otherwise promote to complex128 safely
-    if not np.iscomplexobj(A):
-        A = A.astype(np.complex128)
-
     rng = np.random.default_rng(seed)
 
-    basis = [A[i].copy() for i in range(3)]
+    basis = [mat_with_ortogonal_rows[i].copy() for i in range(len(mat_with_ortogonal_rows))]
 
     def hermitian_proj_coeff(b, w):
         # coefficient c such that w - c*b removes component along b:
-        # c = <b,w>/<b,b> with Hermitian inner product implemented by vdot (conjugates first arg) [web:28]
+        # c = <b,w>/<b,b> with Hermitian inner product implemented by vdot (conjugates first arg)
         bb = np.vdot(b, b)
         if np.abs(bb) <= tol:
             return 0.0 + 0.0j
@@ -195,21 +187,21 @@ def extend_to_orthonormal_rows(mat_with_ortogonal_rows, seed=None, tol=1e-12, ma
 
     Q = np.stack(basis, axis=0)  # (12, 12)
 
-    # Normalize rows at the end using the Hermitian norm ||q|| = sqrt(<q,q>) [web:28]
-    row_norms = np.sqrt(np.real(np.vdot(Q, Q).reshape(1, 1)))  # not used; kept simple below
+    def per_row_norms(matrix):
+        return np.sqrt(np.real(np.einsum('ij,ij->i', matrix.conj(), matrix)))
 
-    # Better: per-row norms
-    norms = np.sqrt(np.real(np.einsum('ij,ij->i', Q.conj(), Q)))
+    # Better: per-row norms using the Hermitian norm ||q|| = sqrt(<q,q>)
+    norms = per_row_norms(Q)
     Q = Q / norms[:, None]
 
+    assert np.allclose(per_row_norms(Q), 1)
     return Q
 
 # ----- 6. Boson-sampling-assisted Monte Carlo integration -----
-
 def boson_sampling_monte_carlo(
     positions,
     input_occupation=None,
-    n_samples=10_000,
+    n_samples=1000,
     potential_fn=efimov_potential_3body,
     simulator_cls=pq.SamplingSimulator,
 ):
@@ -244,16 +236,17 @@ def boson_sampling_monte_carlo(
         result = sim.execute(prog)
         pattern = result.samples  # list of photon counts per mode
         X = pattern_to_positions(np.array(pattern[0]), positions)
+
+        # Discard samples that are not collision-free three-click events
         if len(X) != 3:
-            continue  # enforce 3-boson (collision-free) sector
+            continue
         values.append(potential_fn(X))
 
     if len(values) == 0:
-        raise RuntimeError("No valid 3-boson samples collected.")
+        raise RuntimeError("No valid 3-photon samples collected.")
     return np.mean(values), np.std(values) / np.sqrt(len(values))
 
 # ----- 7. Example usage -----
-
 if __name__ == "__main__":
     # Discretize a line or 2D strip into modes
     # Example: 12 modes on x-axis, y = 0
@@ -264,6 +257,6 @@ if __name__ == "__main__":
 
     estimate, error = boson_sampling_monte_carlo(
         positions,
-        n_samples=10000,
+        n_samples=1000,
     )
     print(f"Estimated E^(1) ≈ {estimate:.4f} ± {error:.4f}")
