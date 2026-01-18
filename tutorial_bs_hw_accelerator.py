@@ -8,7 +8,43 @@ from scipy.special import factorial, genlaguerre
 from scipy.constants import pi
 from scipy.linalg import sqrtm
 
+"""
+Boson-sampling Monte Carlo accelerator tutorial
+
+This script accompanies the manuscript "Experimental demonstration of boson
+sampling as a hardware accelerator for Monte Carlo integration" and provides a
+a Piquasso-based script that implements the core algorithm.
+
+The workflow below follows these high-level steps:
+
+1. Discretize space and build single-particle orbitals evaluated at detector/mode
+    positions (orbital matrix).
+2. Orthogonalize the orbital matrix using Löwdin (symmetric) orthogonalization
+    to obtain a matrix with orthonormal rows.
+3. Extend the orthogonal rows into a full unitary (interferometer) that can be
+    executed on a linear optical sampler (here we use a random completion).
+4. Use Piquasso to build and execute a boson-sampling program implementing the
+ unitary and sample output photon patterns.
+5. Map detected photon patterns back to particle positions and evaluate the
+    target potential function (e.g. Efimov-inspired 3-body potential) to form
+    Monte Carlo estimates.
+"""
+
 def lowdin(P):
+    """Compute the Löwdin (symmetric) orthogonalization of a matrix.
+
+    Args:
+        P (ndarray): Input array with shape (n, k). Rows are the vectors to
+            orthogonalize.
+
+    Returns:
+        ndarray: Matrix `B` with same shape as `P` whose rows are orthonormal
+            under the Hermitian inner product (so that `B @ B.conj().T == I`
+            or `B.T.conj() @ B == I` depending on shapes).
+
+    Raises:
+        AssertionError: If internal numerical checks for orthonormality fail.
+    """
     n, k = P.shape
 
     U, _, Vh = np.linalg.svd(P, full_matrices=False)
@@ -28,20 +64,26 @@ def lowdin(P):
     return b
 
 def eigenfunction_2d_equation17(x, y, n, m):
-    """
-    Equation (17): Phase-convention eigenfunction ψ_{nm}(x, y) used throughout the paper.
-    ψ_{nm} = √[1/((1/2(n-m))! (1/2(n+m))!)] * r^m / √π * L^m_{(n-m)/2}(r²) * e^{-r²/2} * e^{i m φ}
+    """Evaluate the phase-convention eigenfunction psi_{n,m}(x, y).
 
-    Converts Cartesian (x,y) to polar (r, φ) internally.
-    Uses the specific phase convention from eqs (13)-(17) [web:1].
+    This is the function described in manuscript "Energy level
+    splitting for weakly interacting bosons in a harmonic trap" as
+    equation (17).
 
-    Parameters:
-    x, y: Cartesian coordinates
-    n: principal quantum number (n >= |m|, n - m even)
-    m: angular momentum quantum number (m >= 0 for this form)
+    Implements the Laguerre-based radial eigenfunction with angular dependence
+    e^{i m phi} and the normalization convention used in the manuscript
+    (see eqs. (13)-(17)). Cartesian inputs are converted to polar
+    coordinates internally.
+
+    Args:
+        x (float or ndarray): x coordinate(s).
+        y (float or ndarray): y coordinate(s).
+        n (int): Principal quantum number. Must satisfy n >= |m| and n-m even.
+        m (int): Angular momentum quantum number (m >= 0 for this form).
 
     Returns:
-    ψ_{nm}(x, y)
+        complex or ndarray: The value(s) of psi_{n,m}(x, y). If the supplied
+            quantum numbers are invalid (e.g. n < m or n-m odd) returns 0.0.
     """
     r = np.sqrt(x**2 + y**2)
     phi = np.arctan2(y, x)
@@ -57,7 +99,7 @@ def eigenfunction_2d_equation17(x, y, n, m):
     # Normalization factor from eq (17)
     norm_factor = np.sqrt(fact1 / fact2)
 
-    # Laguerre polynomial L^m_{(n-m)/2}(r²) - no absolute value on m
+    # Laguerre polynomial L^m_{(n-m)/2}(r^2) - no absolute value on m
     laguerre_arg = r**2
     L = genlaguerre(m, (n - m)/2)(laguerre_arg)
 
@@ -67,11 +109,32 @@ def eigenfunction_2d_equation17(x, y, n, m):
     return psi
 
 
+# Step 1 - Discretize space and build single-particle orbitals
+"""
+ Discretize a spatial region into a set of `m` detector/mode positions and
+evaluate single-particle eigenfunctions psi_{n,m}(x,y) on those positions. The
+result is an orbital matrix with shape (n_orbitals, n_modes) which encodes the
+overlap between spatial modes and basis orbitals. This matrix is the starting
+    point for constructing a unitary interferometer (via Löwdin orthogonalization).
+"""
+
 # ----- 1. Discretize space and build orbitals -----
 def build_single_particle_orbitals(positions, quantum_numbers=None):
-    """
-    positions: array of shape (n_modes, 2) with (x,y) for each spatial mode χ_j
-    returns: orbital_matrix[i, j] = ψ_i(χ_j)
+    """Build an orbital matrix by evaluating single-particle eigenfunctions.
+
+    The returned matrix has shape `(n_orbitals, n_modes)` and its element
+    `(i, j)` is the value of orbital `i` evaluated at spatial position `j`.
+
+    Args:
+        positions (ndarray): Array of shape `(n_modes, 2)` containing (x, y)
+            coordinates for each spatial mode chi_j.
+        quantum_numbers (list[tuple] or None): Sequence of `(n, m)` quantum
+            numbers defining which eigenfunctions to include. If ``None``, a
+            small default set is used.
+
+    Returns:
+        ndarray: Complex array `orbital_matrix` with shape
+            `(n_orbitals, n_modes)` where `orbital_matrix[i, j] = psi_i(chi_j)`.
     """
     # Example: label orbitals by (n, m) along some sequence
     # You can change this to match the spectrum you want.
@@ -87,12 +150,47 @@ def build_single_particle_orbitals(positions, quantum_numbers=None):
             orbital_matrix[i, j] = eigenfunction_2d_equation17(x, y, n, m)
     return orbital_matrix
 
+"""
+Step 2 - Orthogonalization (Löwdin / symmetric)
+
+After evaluating single-particle orbitals on a discrete set of detector
+positions we obtain an (n_orbitals x m) orbital matrix. To use these orbitals
+as input to a linear-optical interferometer we require an orthonormal set of
+mode functions. Löwdin (symmetric) orthogonalization produces the closest
+orthonormal set to the original rows while preserving the subspace they span.
+We implement this with an SVD-based construction which is numerically stable
+and convenient for our purpose of constructing a boson-sampling program.
+"""
+
+"""
+Step 3 - Build a Piquasso boson-sampling program
+
+Description:
+We convert a unitary describing a linear interferometer into a Piquasso
+program. The program prepares a vacuum, creates Fock excitations according to
+an input occupation vector, applies the interferometer and finally measures all
+modes in the photon-number basis. This program can then be executed by one of
+Piquasso's simulators or an experimental backend.
+"""
+
 # ----- 3. Piquasso boson-sampling circuit -----
 
 def build_piquasso_program(unitary, input_occupation):
-    """
-    unitary: m×m complex array
-    input_occupation: list/array of length m with photon numbers per mode
+    """Construct a Piquasso `Program` implementing a linear interferometer.
+
+    The constructed program prepares the vacuum state across `m` modes, adds
+    Fock excitations according to `input_occupation`, applies the linear
+    interferometer specified by `unitary` and appends a particle-number
+    measurement on all modes.
+
+    Args:
+        unitary (ndarray): Square complex matrix of shape (m, m) describing a
+            linear interferometer acting on `m` modes.
+        input_occupation (Sequence[int]): Length-`m` iterable with the number
+            of photons to create in each input mode.
+
+    Returns:
+        pq.Program: A Piquasso program ready for execution by a sampler.
     """
     m = unitary.shape[0]
     instructions = []
@@ -112,24 +210,63 @@ def build_piquasso_program(unitary, input_occupation):
 
     return pq.Program(instructions=instructions)
 
+"""
+Step 4 - Map detection patterns back to particle positions
+
+After sampling photon-number outputs from the boson sampler, we map detector
+clicks (occupied modes) back to spatial coordinates. For collision-free
+samples (0/1 per mode) this yields a configuration of particle positions that
+can be used to evaluate the classical observable V(X).
+"""
+
 # ----- 4. Map detection pattern to particle positions -----
 
 def pattern_to_positions(pattern, positions):
-    """
-    pattern: list/array of photon numbers per mode (length m)
-    positions: array (m, 2) giving (x,y) per mode
-    returns: array of shape (n_bosons, 2) with positions of each boson
-    collision-free assumed here (0 or 1 per mode).
+    """Map a detected photon-number pattern to particle positions.
+
+    For collision-free samples (0 or 1 photons per mode) this returns the
+    list of spatial coordinates corresponding to modes that registered a
+    photon. If collisions (multiple photons in a mode) are present the
+    function returns the positions of occupied modes with multiplicity omitted.
+
+    Args:
+        pattern (Sequence[int]): Photon counts per mode (length `m`).
+        positions (ndarray): Array of shape (m, 2) giving (x, y) coordinates
+            for each mode.
+
+    Returns:
+        ndarray: Array of shape (n_bosons, 2) containing positions of each
+            detected boson (collision-free assumption recommended).
     """
     idx = [i for i, n in enumerate(pattern) if n == 1]
     return positions[idx, :]
 
+"""
+Step 5 - Define the target perturbation V(X)
+
+In the paper the authors evaluate a classical perturbation V(X) (here we use a
+simple Efimov-inspired 3-body potential as an illustrative example). After
+mapping detection patterns to particle positions, this function computes the
+classical observable h(X) = V(X) for use in the Monte Carlo estimator.
+"""
+
 # ----- 5. Define perturbation V(X) (Efimov-like example) -----
 
 def efimov_potential_3body(positions_xyz, C=1.0):
-    """
-    positions_xyz: array (3, 2) for 3 bosons in 2D (x,y).
-    Uses the 1D/2D version of the Efimov-inspired potential described in the paper.
+    """Evaluate an Efimov-inspired 3-body potential for three particles.
+
+    This is an illustrative potential inspired by Efimov-like scaling used in
+    the manuscript. The function accepts an array of three 2D coordinates and
+    returns a scalar potential value. A small-distance cutoff is handled by
+    returning 0.0 when the metric R^2 would be zero.
+
+    Args:
+        positions_xyz (ndarray): Array of shape (3, 2) containing (x, y)
+            coordinates for three particles.
+        C (float): Strength parameter for the potential (default: 1.0).
+
+    Returns:
+        float: The scalar potential value V(X) for the input configuration.
     """
     x = positions_xyz
     r12 = np.linalg.norm(x[0] - x[1])
@@ -142,17 +279,29 @@ def efimov_potential_3body(positions_xyz, C=1.0):
     return -(C + 1/4) / R2
 
 def extend_to_orthonormal_rows(mat_with_ortogonal_rows, seed=None, tol=1e-12, max_tries=10_000):
-    """
+    """Extend a set of mutually orthogonal rows to a full orthonormal basis.
+
+    Given an input matrix whose rows are mutually orthogonal (but not a full
+    basis), this routine samples random complex vectors, removes components
+    along the existing rows (Hermitian Gram-Schmidt style) and accepts
+    independent vectors until a complete set of `n` rows is obtained. Rows are
+    then normalized so that the returned matrix `Q` satisfies
+    `Q @ Q.conj().T == I`.
 
     Args:
-
-       mat_with_ortogonal_rows: (3, 12) numpy array (real or complex). Rows assumed mutually orthogonal
-           under the Hermitian inner product <u,v> = vdot(u,v).
+        mat_with_ortogonal_rows (ndarray): Array of shape (r, n) where `r < n`
+            and rows are mutually orthogonal under the Hermitian inner product.
+        seed (int or None): Optional RNG seed for reproducibility.
+        tol (float): Numerical tolerance for independence checks.
+        max_tries (int): Maximum number of random trials used to find
+            additional independent vectors.
 
     Returns:
+        ndarray: A square `(n, n)` complex matrix whose rows are orthonormal.
 
-      Q: (12, 12) with orthonormal rows under Hermitian inner product,
-         i.e., Q @ Q.conj().T == I.
+    Raises:
+        RuntimeError: If the algorithm fails to find enough independent
+            vectors within `max_tries` attempts.
     """
     rng = np.random.default_rng(seed)
 
@@ -198,6 +347,18 @@ def extend_to_orthonormal_rows(mat_with_ortogonal_rows, seed=None, tol=1e-12, ma
     return Q
 
 # ----- 6. Boson-sampling-assisted Monte Carlo integration -----
+"""
+Step 6 - Monte Carlo sampling loop and estimator
+
+This step runs the sampler many times to generate detection patterns X drawn
+approximately from g(X) approx |Psi_0(X)|^2. Collision-free events are mapped back to
+particle positions and the classical observable h(X) = V(X) is evaluated for
+each sample. The Monte Carlo estimator is the empirical mean of h(X) over the
+collected, valid samples; the function returns the mean and the standard error
+of the mean. In practice one should monitor the fraction of valid (collision-
+free) samples and increase `n_samples` or adjust the encoding to obtain enough
+statistics.
+"""
 def boson_sampling_monte_carlo(
     positions,
     input_occupation=None,
@@ -205,11 +366,36 @@ def boson_sampling_monte_carlo(
     potential_fn=efimov_potential_3body,
     simulator_cls=pq.SamplingSimulator,
 ):
-    """
-    Implements the algorithm of the paper:
-    - g(X) = |Ψ_0(X)|^2 encoded in boson sampler
-    - h(X) = V(X) evaluated classically
-    - F ≈ (1/N) ∑ h(X_i) with X_i ~ g
+    """Estimate an expectation value by boson-sampling-assisted Monte Carlo.
+
+    The procedure implemented here follows the algorithm described in the
+    manuscript:
+
+     1. Construct single-particle orbitals evaluated at detector/mode
+         positions to form an orbital matrix `chi`.
+     2. Apply Löwdin symmetric orthogonalization to obtain orthonormal rows
+         spanning the same subspace as `chi`.
+    3. Extend the orthonormal rows to a full unitary `U` which is used as the
+       linear interferometer in a boson sampler.
+    4. Use Piquasso to sample collision-free detection events X distributed
+    according to g(X) approx |Psi_0(X)|^2 and evaluate h(X) = V(X) classically for
+       each sample. The Monte Carlo estimate is the empirical mean of h(X).
+
+    Args:
+        positions (ndarray): Array of shape (m, 2) with coordinates for `m`
+            spatial modes.
+        input_occupation (Sequence[int] or None): Length-`m` photon occupation
+            vector describing the Fock input state. If `None`, a default state
+            with one photon in the first three modes is used.
+        n_samples (int): Number of sampler executions to attempt.
+        potential_fn (callable): Function V(X) that maps a particle configuration
+            `X` (array of positions) to a scalar value.
+        simulator_cls (type): Piquasso simulator class used to execute the
+            program (defaults to `pq.SamplingSimulator`).
+
+    Returns:
+        tuple: `(estimate, stderr)` where `estimate` is the sample mean of
+            `h(X)` and `stderr` is the standard error of the mean.
     """
     m = positions.shape[0]
     if input_occupation is None:
@@ -259,4 +445,4 @@ if __name__ == "__main__":
         positions,
         n_samples=1000,
     )
-    print(f"Estimated E^(1) ≈ {estimate:.4f} ± {error:.4f}")
+    print(f"Estimated E^(1) approx {estimate:.4f} +/- {error:.4f}")
