@@ -1,3 +1,5 @@
+from ast import pattern
+from random import seed
 import numpy as np
 
 import piquasso as pq
@@ -7,6 +9,19 @@ import numpy as np
 from scipy.special import factorial, genlaguerre
 from scipy.constants import pi
 from scipy.linalg import sqrtm
+
+import numpy as np
+import itertools
+
+def perm_3x3(A):
+    return (
+        A[0, 0]*A[1, 1]*A[2, 2] +
+        A[0, 0]*A[2, 1]*A[1, 2] +
+        A[1, 0]*A[0, 1]*A[2, 2] +
+        A[1, 0]*A[2, 1]*A[0, 2] +
+        A[2, 0]*A[0, 1]*A[1, 2] +
+        A[2, 0]*A[1, 1]*A[0, 2]
+    )
 
 """
 Boson-sampling Monte Carlo accelerator tutorial
@@ -199,7 +214,7 @@ def build_piquasso_program(unitary, input_occupation):
 
     # Prepare Fock input state
     for mode, n in enumerate(input_occupation):
-        if n > 0:
+        if n == 1:
             instructions.append(pq.Create().on_modes(mode))
 
     # Apply linear interferometer corresponding to unitary
@@ -346,6 +361,71 @@ def extend_to_orthonormal_rows(mat_with_ortogonal_rows, seed=None, tol=1e-12, ma
     assert np.allclose(per_row_norms(Q), 1)
     return Q
 
+def get_classical_vals(input_occupation, unitary, positions, n_samples=10000, potential_fn=efimov_potential_3body):
+    # Enumerate all collision-free outputs S (size-3 subsets of output modes)
+
+    m = positions.shape[0]
+
+    in_modes = [i for i, n in enumerate(input_occupation) if n == 1]
+
+    # Row-reduction
+    Uin = unitary[np.array(in_modes), :]  # 3 x m
+
+    # Choose what modes one photon can be detected - form the combinations
+    patterns = list(itertools.combinations(range(m), 3))
+    weights = np.empty(len(patterns), dtype=float)
+
+    for k, S in enumerate(patterns):
+        sub = Uin[:, S]       # 3 x 3
+        weights[k] = np.abs(perm_3x3(sub))**2
+
+    # Condition on collision-free outputs (since your quantum loop discards others)
+    Z = weights.sum()
+    pmf = weights / Z
+
+    assert pmf.sum() - 1.0 < 1e-10
+
+    rng = 0
+    rng = np.random.default_rng(rng)
+    idx = rng.choice(len(patterns), size=n_samples, p=pmf, replace=True)
+
+    vals = []
+    for i in idx:
+        S = patterns[i]
+        X = positions[np.array(S), :]  # always 3 points
+        vals.append(potential_fn(X))
+
+    vals = np.asarray(vals, dtype=float)
+    return vals.mean(), vals.std(ddof=1) / np.sqrt(len(vals))
+
+def get_bs_positions(input_occupation, unitary, positions):
+
+    sim = pq.SamplingSimulator(d=12, config=pq.Config(seed_sequence=0))
+
+    # 2) Build Piquasso program and simulator
+    prog = build_piquasso_program(unitary, input_occupation)
+    result = sim.execute(prog)
+    pattern = result.samples  # list of photon counts per mode
+    idx = [i for i, n in enumerate(pattern[0]) if n == 1]
+    return positions[idx, :]
+
+def get_bs_vals(input_occupation, unitary, positions, n_samples=10000, potential_fn=efimov_potential_3body):
+
+    # 3) Sample patterns and accumulate h(X)
+    values = []
+    for _ in range(n_samples):
+        X = get_bs_positions(input_occupation, unitary, positions)
+
+        # Discard samples that are not collision-free three-click events
+        if len(X) != 3:
+            continue
+        values.append(potential_fn(X))
+
+    if len(values) == 0:
+        raise RuntimeError("No valid 3-photon samples collected.")
+    return np.mean(values), np.std(values) / np.sqrt(len(values)), len(values)
+
+
 # ----- 6. Boson-sampling-assisted Monte Carlo integration -----
 """
 Step 6 - Monte Carlo sampling loop and estimator
@@ -364,7 +444,6 @@ def boson_sampling_monte_carlo(
     input_occupation=None,
     n_samples=1000,
     potential_fn=efimov_potential_3body,
-    simulator_cls=pq.SamplingSimulator,
 ):
     """Estimate an expectation value by boson-sampling-assisted Monte Carlo.
 
@@ -412,25 +491,9 @@ def boson_sampling_monte_carlo(
 
     unitary = extend_to_orthonormal_rows(ortogonal_rows_mat, seed=0)
 
-    # 2) Build Piquasso program and simulator
-    prog = build_piquasso_program(unitary, input_occupation)
-    sim = simulator_cls()
-
-    # 3) Sample patterns and accumulate h(X)
-    values = []
-    for _ in range(n_samples):
-        result = sim.execute(prog)
-        pattern = result.samples  # list of photon counts per mode
-        X = pattern_to_positions(np.array(pattern[0]), positions)
-
-        # Discard samples that are not collision-free three-click events
-        if len(X) != 3:
-            continue
-        values.append(potential_fn(X))
-
-    if len(values) == 0:
-        raise RuntimeError("No valid 3-photon samples collected.")
-    return np.mean(values), np.std(values) / np.sqrt(len(values))
+    bs_vals1, bs_vals2, len_bs_vals = get_bs_vals(input_occupation, unitary, positions, n_samples, potential_fn)
+    classical_vals = get_classical_vals(input_occupation, unitary, positions, len_bs_vals, potential_fn)
+    return (bs_vals1, bs_vals2), classical_vals
 
 # ----- 7. Example usage -----
 if __name__ == "__main__":
@@ -441,8 +504,9 @@ if __name__ == "__main__":
     ys = np.zeros_like(xs)
     positions = np.stack([xs, ys], axis=1)
 
-    estimate, error = boson_sampling_monte_carlo(
+    (estimate1, error1), (estimate2, error2) = boson_sampling_monte_carlo(
         positions,
         n_samples=1000,
     )
-    print(f"Estimated E^(1) approx {estimate:.4f} +/- {error:.4f}")
+    print(f"Estimated E^(1) approx {estimate1:.4f} +/- {error1:.4f}")
+    print(f"Classical estimated E^(1) approx {estimate2:.6f} +/- {error2:.6f}")
