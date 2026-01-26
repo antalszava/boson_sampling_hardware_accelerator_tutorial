@@ -366,14 +366,14 @@ def get_classical_vals(input_occupation, unitary, positions, n_samples=10000,
     in_modes = [i for i, n in enumerate(input_occupation) if n == 1]
 
     # Row-reduction: extract rows corresponding to input modes
-    Uin = unitary[np.array(in_modes), :]  # 3 x m
+    Uin = unitary[:, np.array(in_modes)]  # m x 3
 
     # Form all possible output mode combinations
     patterns = list(itertools.combinations(range(m), 3))
     weights = np.empty(len(patterns), dtype=float)
 
     for k, S in enumerate(patterns):
-        sub = Uin[:, S]  # 3 x 3 submatrix
+        sub = Uin[S, :]  # 3 x 3 submatrix
         weights[k] = np.abs(perm_3x3(sub))**2
 
     # Condition on collision-free outputs
@@ -382,38 +382,19 @@ def get_classical_vals(input_occupation, unitary, positions, n_samples=10000,
 
     assert pmf.sum() - 1.0 < 1e-10, "Probability distribution not normalized"
 
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(42)
     idx = rng.choice(len(patterns), size=n_samples, p=pmf, replace=True)
 
     vals = []
     for i in idx:
         S = patterns[i]
         X = positions[np.array(S), :]  # Always 3 points
+        if len(X) != 3:
+            continue
         vals.append(potential_fn(X))
 
     vals = np.asarray(vals, dtype=float)
     return vals.mean(), vals.std(ddof=1) / np.sqrt(len(vals))
-
-def get_bs_positions(input_occupation, unitary, positions):
-    """Sample boson-sampling output and map to particle positions.
-
-    Args:
-        input_occupation (Sequence[int]): Photon occupation vector.
-        unitary (ndarray): Square unitary matrix of shape (m, m).
-        positions (ndarray): Array of shape (m, 2) with mode positions.
-
-    Returns:
-        ndarray: Array of detected particle positions.
-    """
-    m = positions.shape[0]
-    sim = pq.SamplingSimulator(d=m, config=pq.Config(seed_sequence=0))
-
-    # Build and execute Piquasso program
-    prog = build_piquasso_program(unitary, input_occupation)
-    result = sim.execute(prog)
-    pattern = result.samples[0]  # Get photon counts per mode
-    idx = [i for i, n in enumerate(pattern) if n == 1]
-    return positions[idx, :]
 
 def get_bs_vals(input_occupation, unitary, positions, n_samples=10000,
                 potential_fn=efimov_potential_3body):
@@ -433,8 +414,16 @@ def get_bs_vals(input_occupation, unitary, positions, n_samples=10000,
         RuntimeError: If no valid 3-photon samples are collected.
     """
     values = []
-    for _ in range(n_samples):
-        X = get_bs_positions(input_occupation, unitary, positions)
+    m = positions.shape[0]
+    sim = pq.SamplingSimulator(d=m)
+
+    # Build and execute Piquasso program
+    prog = build_piquasso_program(unitary, input_occupation)
+    result = sim.execute(prog, shots=n_samples)
+
+    for pattern in result.samples:
+        idx = [i for i, n in enumerate(pattern) if n == 1]
+        X = positions[idx, :]
 
         # Discard samples that are not collision-free three-click events
         if len(X) != 3:
@@ -524,10 +513,12 @@ if __name__ == "__main__":
     xs = np.linspace(-3.0, 3.0, n_modes)
     ys = np.zeros_like(xs)
     positions = np.stack([xs, ys], axis=1)
+    n_samples = 1000
 
     (bs_estimate, bs_error), (classical_estimate, classical_error) = (
-        boson_sampling_monte_carlo(positions, n_samples=1000))
+        boson_sampling_monte_carlo(positions, n_samples=n_samples))
 
-    print(f"BS estimated E^(1):       {bs_estimate:.4f} +/- {bs_error:.4f}")
-    print(f"Classical estimated E^(1): {classical_estimate:.6f} +/- "
+    print(f"Piquasso estimated E^(1):       {bs_estimate:.4f} +/- {bs_error:.4f}")
+    print(f"Naive permanent computation E^(1): {classical_estimate:.6f} +/- "
           f"{classical_error:.6f}")
+    print(f"Difference: {abs(bs_estimate - classical_estimate):.6f}")
