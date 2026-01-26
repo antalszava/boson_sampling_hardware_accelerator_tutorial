@@ -342,7 +342,7 @@ def perm_3x3(A):
         A[2, 0]*A[1, 1]*A[0, 2]
     )
 
-def get_classical_vals(input_occupation, unitary, positions, n_samples=10000,
+def sampling_prob_distribution_naively(input_occupation, unitary, positions, n_samples=10000,
                         potential_fn=efimov_potential_3body):
     """Get classical Monte Carlo estimates from theoretical distribution.
 
@@ -396,7 +396,7 @@ def get_classical_vals(input_occupation, unitary, positions, n_samples=10000,
     vals = np.asarray(vals, dtype=float)
     return vals.mean(), vals.std(ddof=1) / np.sqrt(len(vals))
 
-def get_bs_vals(input_occupation, unitary, positions, n_samples=10000,
+def piquasso_boson_sampling(input_occupation, unitary, positions, n_samples=10000,
                 potential_fn=efimov_potential_3body):
     """Sample boson sampler and accumulate potential function values.
 
@@ -497,11 +497,11 @@ def boson_sampling_monte_carlo(
     unitary = extend_to_orthonormal_rows(orthogonal_rows_mat, seed=0)
 
     # Step 4: Sample from boson sampler
-    bs_mean, bs_error, len_bs_vals = get_bs_vals(
+    bs_mean, bs_error, len_bs_vals = piquasso_boson_sampling(
         input_occupation, unitary, positions, n_samples, potential_fn)
 
     # Step 5: Get theoretical distribution estimate
-    classical_mean, classical_error = get_classical_vals(
+    classical_mean, classical_error = sampling_prob_distribution_naively(
         input_occupation, unitary, positions, len_bs_vals, potential_fn)
 
     return (bs_mean, bs_error), (classical_mean, classical_error)
