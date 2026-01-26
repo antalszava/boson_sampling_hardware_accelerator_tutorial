@@ -513,7 +513,7 @@ if __name__ == "__main__":
     xs = np.linspace(-3.0, 3.0, n_modes)
     ys = np.zeros_like(xs)
     positions = np.stack([xs, ys], axis=1)
-    n_samples = 1000
+    n_samples = 10000
 
     (bs_estimate, bs_error), (classical_estimate, classical_error) = (
         boson_sampling_monte_carlo(positions, n_samples=n_samples))
